@@ -15,13 +15,15 @@ public:
     {
         std::atomic<node *> next_;
         T value_;
-        node(T value) : value_(value) {}
+        node(T value, node *next = nullptr) : value_(value)
+        {
+            next_.store(next, std::memory_order_relaxed);
+        }
     };
 
     spsc_queue()
     {
         node *n = new node(0);
-        n->next_ = 0;
         tail_ = head_ = first_ = tail_copy_ = n;
     }
 
@@ -39,14 +41,13 @@ public:
     {
         node *n = alloc_node(v);
         n->next_ = nullptr;
-        n->value_ = v;
 
         /*
          * when head_->next_ == tail_->next
          * synchronize with tail_->next
          */
         node *head = head_.load(std::memory_order_relaxed);
-        head->next_.store(n, std::memory_order_release);
+        head->next_.store(n, std::memory_order_release); // 1. synchronize with consumer
         head_ = n;
     }
 
@@ -57,12 +58,12 @@ public:
          * synchronize with tail_->next
          */
         node *tail = tail_.load(std::memory_order_relaxed);
-        node *tail_next = tail->next_.load(std::memory_order_consume);
+        node *tail_next = tail->next_.load(std::memory_order_consume); // 1. synchronize with producer
 
         if (tail_next) {
             v = tail_next->value_;
             // synchronize with tail_copy_ load in alloc_node
-            tail_.store(tail_next, std::memory_order_release);
+            tail_.store(tail_next, std::memory_order_release); // 2. synchronize with alloc_node
             return true;
         }
         return false;
@@ -70,9 +71,9 @@ public:
 private:
 
     // producer part
-    std::atomic<node *> head_;
-    std::atomic<node *> first_; // last unused node
-    std::atomic<node *> tail_copy_; // try to catch up tail_ node
+    std::atomic<node *> head_; // head of the queue
+    std::atomic<node *> first_; // last unused node (tail of node cache)
+    std::atomic<node *> tail_copy_; // helper node try to catch up tail_ (between first_ and tail_)
 
     char cache_line_padding_[cache_line_size];
 
@@ -90,19 +91,18 @@ public:
         // if attempt fails, allocates node via ::operator new()
 
         node *first = first_.load(std::memory_order_relaxed);
-        node *tail = tail_copy_.load(std::memory_order_relaxed);
-        
+        node *tail_copy = tail_copy_.load(std::memory_order_relaxed);
 
-        if (first != tail) {
+        if (first != tail_copy) {
             node *n = first;
             n->value_ = v;
             first_.store(first->next_, std::memory_order_relaxed);
             return n;
         }
 
-        tail = tail_.load(std::memory_order_consume);
+        tail_copy_ = tail_.load(std::memory_order_consume); // 2. synchronize with consumer
 
-        if (first != tail) {
+        if (first != tail_copy_) {
             node *n = first;
             n->value_ = v;
             first_.store(first->next_, std::memory_order_relaxed);
